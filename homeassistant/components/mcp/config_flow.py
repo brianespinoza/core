@@ -28,9 +28,19 @@ from homeassistant.helpers.config_entry_oauth2_flow import (
 from homeassistant.helpers.service_info.hassio import HassioServiceInfo
 
 from . import async_get_config_entry_implementation
-from .application_credentials import authorization_server_context
+from .application_credentials import (
+    MCPAuthorizationServer,
+    authorization_server_context,
+)
 from .auth import AuthenticateHeader
-from .const import CONF_AUTHORIZATION_URL, CONF_SCOPE, CONF_SLUG, CONF_TOKEN_URL, DOMAIN
+from .const import (
+    CONF_AUTHORIZATION_URL,
+    CONF_RESOURCE,
+    CONF_SCOPE,
+    CONF_SLUG,
+    CONF_TOKEN_URL,
+    DOMAIN,
+)
 from .coordinator import (
     TokenManager,
     create_mcp_httpx_client,
@@ -340,13 +350,19 @@ class ModelContextProtocolConfigFlow(AbstractOAuth2FlowHandler, domain=DOMAIN):
                     ),
                 }
             )
+            # Discovery checked that the metadata describes this server URL
+            if resource_metadata:
+                self.data[CONF_RESOURCE] = self.data[CONF_URL]
+            else:
+                self.data.pop(CONF_RESOURCE, None)
             return await self.async_step_credentials_choice()
 
-    def authorization_server(self) -> AuthorizationServer:
+    def authorization_server(self) -> MCPAuthorizationServer:
         """Return the authorization server provided by the MCP server."""
-        return AuthorizationServer(
+        return MCPAuthorizationServer(
             self.data[CONF_AUTHORIZATION_URL],
             self.data[CONF_TOKEN_URL],
+            self.data.get(CONF_RESOURCE),
         )
 
     @property

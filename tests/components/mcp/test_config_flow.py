@@ -11,11 +11,13 @@ from pytest_homeassistant.common import MockConfigEntry
 from pytest_homeassistant.test_util.aiohttp import AiohttpClientMocker
 from pytest_homeassistant.typing import ClientSessionGenerator
 import respx
+from yarl import URL
 
 from homeassistant import config_entries
 from homeassistant.components.mcp.auth import AuthenticateHeader
 from homeassistant.components.mcp.const import (
     CONF_AUTHORIZATION_URL,
+    CONF_RESOURCE,
     CONF_SCOPE,
     CONF_SLUG,
     CONF_TOKEN_URL,
@@ -25,11 +27,15 @@ from homeassistant.const import CONF_API_TOKEN, CONF_TOKEN, CONF_URL
 from homeassistant.core import HomeAssistant
 from homeassistant.data_entry_flow import FlowResultType
 from homeassistant.helpers import config_entry_oauth2_flow
+from homeassistant.helpers.config_entry_oauth2_flow import (
+    LocalOAuth2ImplementationWithPkce,
+)
 from homeassistant.helpers.service_info.hassio import HassioServiceInfo
 
 from .conftest import (
     AUTH_DOMAIN,
     CLIENT_ID,
+    CLIENT_SECRET,
     MCP_SERVER_URL,
     OAUTH_AUTHORIZE_URL,
     OAUTH_TOKEN_URL,
@@ -332,6 +338,7 @@ async def perform_oauth_flow(
     authorize_url: str = OAUTH_AUTHORIZE_URL,
     token_url: str = OAUTH_TOKEN_URL,
     scopes: list[str] | None = None,
+    resource: str | None = None,
 ) -> config_entries.ConfigFlowResult:
     """Perform the common steps of the OAuth flow.
 
@@ -344,16 +351,25 @@ async def perform_oauth_flow(
             "redirect_uri": OAUTH_CALLBACK_URL,
         },
     )
-    scope_param = ""
-    if scopes:
-        scope_param = "&scope=" + "+".join(scopes)
-    assert result["url"] == (
-        f"{authorize_url}?response_type=code&client_id={CLIENT_ID}"
-        f"&redirect_uri={OAUTH_CALLBACK_URL}"
-        f"&state={state}"
+    url = URL(result["url"])
+    assert str(url.with_query(None)) == authorize_url
+    query = dict(url.query)
+    assert query.pop("code_challenge")
+    expected_query = {
+        "response_type": "code",
+        "client_id": CLIENT_ID,
+        "redirect_uri": OAUTH_CALLBACK_URL,
+        "state": state,
+        "code_challenge_method": "S256",
         # Asked for so the server hands back a refresh token
-        f"&access_type=offline&prompt=consent{scope_param}"
-    )
+        "access_type": "offline",
+        "prompt": "consent",
+    }
+    if scopes:
+        expected_query["scope"] = " ".join(scopes)
+    if resource:
+        expected_query["resource"] = resource
+    assert query == expected_query
 
     client = await hass_client_no_auth()
     resp = await client.get(f"{CALLBACK_PATH}?code={OAUTH_CODE}&state={state}")
@@ -366,6 +382,31 @@ async def perform_oauth_flow(
     )
 
     return result
+
+
+def assert_token_request(
+    aioclient_mock: AiohttpClientMocker,
+    authorize_url: str,
+    resource: str | None = None,
+) -> None:
+    """Assert the code exchange sent the PKCE verifier and the resource."""
+    assert len(aioclient_mock.mock_calls) == 1
+    data = dict(aioclient_mock.mock_calls[0][2])
+    code_verifier = data.pop("code_verifier")
+    assert (
+        LocalOAuth2ImplementationWithPkce.compute_code_challenge(code_verifier)
+        == URL(authorize_url).query["code_challenge"]
+    )
+    expected_data = {
+        "grant_type": "authorization_code",
+        "code": OAUTH_CODE,
+        "redirect_uri": OAUTH_CALLBACK_URL,
+        "client_id": CLIENT_ID,
+        "client_secret": CLIENT_SECRET,
+    }
+    if resource:
+        expected_data["resource"] = resource
+    assert data == expected_data
 
 
 @pytest.mark.parametrize(
@@ -457,6 +498,7 @@ async def test_authentication_flow(
         token_url=expected_token_url,
         scopes=scopes,
     )
+    authorize_url = result["url"]
 
     # Client now accepts credentials
     mock_mcp_client.side_effect = None
@@ -468,6 +510,7 @@ async def test_authentication_flow(
     assert result["type"] is FlowResultType.CREATE_ENTRY
     assert result["title"] == TEST_API_NAME
     assert result["result"].unique_id is None
+    assert_token_request(aioclient_mock, authorize_url)
     data = result["data"]
     token = data.pop(CONF_TOKEN)
     assert data == {
@@ -577,7 +620,9 @@ async def test_authentication_discovery_via_header(
         authorize_url=OAUTH_AUTHORIZE_URL,
         token_url=OAUTH_TOKEN_URL,
         scopes=expected_scopes,
+        resource=MCP_SERVER_URL,
     )
+    authorize_url = result["url"]
 
     # Client now accepts credentials
     mock_mcp_client.side_effect = None
@@ -588,6 +633,7 @@ async def test_authentication_discovery_via_header(
     result = await hass.config_entries.flow.async_configure(result["flow_id"])
     assert result["type"] is FlowResultType.CREATE_ENTRY
     assert result["title"] == TEST_API_NAME
+    assert_token_request(aioclient_mock, authorize_url, resource=MCP_SERVER_URL)
     data = result["data"]
     token = data.pop(CONF_TOKEN)
     assert data == {
@@ -596,6 +642,7 @@ async def test_authentication_discovery_via_header(
         CONF_AUTHORIZATION_URL: OAUTH_AUTHORIZE_URL,
         CONF_TOKEN_URL: OAUTH_TOKEN_URL,
         CONF_SCOPE: expected_scopes,
+        CONF_RESOURCE: MCP_SERVER_URL,
     }
     assert token
     token.pop("expires_at")
@@ -979,7 +1026,9 @@ async def test_reauth_flow_upgrade_to_oauth(
         authorize_url=OAUTH_AUTHORIZE_URL,
         token_url=OAUTH_TOKEN_URL,
         scopes=SCOPES_SUPPORTED,
+        resource=MCP_SERVER_URL,
     )
+    authorize_url = result["url"]
 
     # Verify we can connect to the server now with the token
     response = Mock()
@@ -990,6 +1039,7 @@ async def test_reauth_flow_upgrade_to_oauth(
     result = await hass.config_entries.flow.async_configure(result["flow_id"])
     assert result["type"] is FlowResultType.ABORT
     assert result["reason"] == "reauth_successful"
+    assert_token_request(aioclient_mock, authorize_url, resource=MCP_SERVER_URL)
 
     assert config_entry.unique_id is None
     assert config_entry.title == TEST_API_NAME
@@ -1001,6 +1051,7 @@ async def test_reauth_flow_upgrade_to_oauth(
         CONF_AUTHORIZATION_URL: OAUTH_AUTHORIZE_URL,
         CONF_TOKEN_URL: OAUTH_TOKEN_URL,
         CONF_SCOPE: SCOPES_SUPPORTED,
+        CONF_RESOURCE: MCP_SERVER_URL,
     }
     assert token
     token.pop("expires_at")
@@ -1067,6 +1118,7 @@ async def test_reauth_flow_missing_implementation(
             CONF_URL: MCP_SERVER_URL,
             CONF_AUTHORIZATION_URL: OAUTH_AUTHORIZE_URL,
             CONF_TOKEN_URL: OAUTH_TOKEN_URL,
+            CONF_RESOURCE: MCP_SERVER_URL,
         },
         title=TEST_API_NAME,
     )
@@ -1104,6 +1156,7 @@ async def test_reauth_flow_missing_implementation(
         token_url=OAUTH_TOKEN_URL,
         scopes=SCOPES,
     )
+    authorize_url = result["url"]
 
     response = Mock()
     response.server_info.name = TEST_API_NAME
@@ -1112,10 +1165,13 @@ async def test_reauth_flow_missing_implementation(
     result = await hass.config_entries.flow.async_configure(result["flow_id"])
     assert result["type"] is FlowResultType.ABORT
     assert result["reason"] == "reauth_successful"
+    assert_token_request(aioclient_mock, authorize_url)
 
     # The entry now points at an implementation that exists again
     assert config_entry.data["auth_implementation"] == AUTH_DOMAIN
     assert config_entry.data[CONF_TOKEN]
+    # Discovery found no protected resource metadata this time
+    assert CONF_RESOURCE not in config_entry.data
     assert len(mock_setup_entry.mock_calls) == 1
 
 

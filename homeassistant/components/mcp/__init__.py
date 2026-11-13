@@ -3,13 +3,21 @@
 from dataclasses import dataclass
 from typing import cast, override
 
-from homeassistant.components.application_credentials import AuthorizationServer
 from homeassistant.const import CONF_ACCESS_TOKEN, CONF_API_TOKEN
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import config_entry_oauth2_flow, llm
 
-from .application_credentials import authorization_server_context
-from .const import CONF_AUTHORIZATION_URL, CONF_SLUG, CONF_TOKEN_URL, DOMAIN
+from .application_credentials import (
+    MCPAuthorizationServer,
+    authorization_server_context,
+)
+from .const import (
+    CONF_AUTHORIZATION_URL,
+    CONF_RESOURCE,
+    CONF_SLUG,
+    CONF_TOKEN_URL,
+    DOMAIN,
+)
 from .coordinator import (
     ModelContextProtocolConfigEntry,
     ModelContextProtocolCoordinator,
@@ -30,9 +38,10 @@ async def async_get_config_entry_implementation(
     if "auth_implementation" not in entry.data:
         return None
     with authorization_server_context(
-        AuthorizationServer(
+        MCPAuthorizationServer(
             authorize_url=entry.data[CONF_AUTHORIZATION_URL],
             token_url=entry.data[CONF_TOKEN_URL],
+            resource=entry.data.get(CONF_RESOURCE),
         )
     ):
         return await config_entry_oauth2_flow.async_get_config_entry_implementation(
